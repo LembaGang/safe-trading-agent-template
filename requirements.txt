@@ -1,0 +1,11 @@
+# Runtime dependencies
+headless-oracle>=0.1.0
+langgraph>=0.2
+langchain-core>=0.2
+langchain-anthropic>=0.3
+python-dotenv>=1.0
+
+# Test dependencies
+pytest>=8
+pytest-mock>=3.12
+PyNaCl>=1.5

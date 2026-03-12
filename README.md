@@ -32,13 +32,19 @@ git clone https://github.com/LembaGang/safe-trading-agent-template
 cd safe-trading-agent-template
 
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -r requirements.txt
 
 cp .env.example .env
 # Edit .env — set ORACLE_API_KEY and optionally ANTHROPIC_API_KEY
 
 python examples/demo_without_llm.py   # No LLM key needed
 python examples/run_agent.py          # Full LangGraph agent
+```
+
+Contributors (editable install with dev extras):
+
+```bash
+pip install -e ".[dev]"
 ```
 
 Get an API key at [headlessoracle.com](https://headlessoracle.com).
