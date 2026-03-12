@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/pip show:*)",
+      "Bash(.venv/Scripts/python -c \"import headless_oracle; print\\(dir\\(headless_oracle\\)\\)\")",
+      "Bash(.venv/Scripts/pip list:*)",
+      "Bash(.venv/Scripts/pytest tests/ -v 2>&1)",
+      "Bash(cd C:/Users/User/safe-trading-agent-template && python -c \"\nfrom simulator.model import build_phantom_hour_timeline, phantom_trade_times\ntimeline = build_phantom_hour_timeline\\(\\)\ntimes = [p.utc_time for p in timeline]\nidx_20 = times.index\\('20:00'\\)\nidx_21 = times.index\\('21:00'\\)\nprint\\(f'idx_20={idx_20}, idx_21={idx_21}, times[idx_20]={times[idx_20]}, times[idx_21]={times[idx_21]}'\\)\nprint\\('No TypeError — index lookup works correctly.'\\)\n\")",
+      "Bash(python -m pytest tests/ -v --tb=short 2>&1 | head -200)",
+      "Bash(python -m pip list 2>&1 | grep -E \"\\(langgraph|headless-oracle|langchain|pytest\\)\" | head -20)",
+      "Bash(python -m pip list 2>&1 | tail -20)",
+      "Bash(python -c \"import sys; import importlib; missing = []; libs = ['langgraph', 'langchain_core', 'langchain_anthropic', 'headless_oracle', 'dotenv']; [missing.append\\(lib\\) if importlib.util.find_spec\\(lib\\) is None else None for lib in libs]; print\\('Missing:', missing if missing else 'None'\\); sys.exit\\(0\\)\")",
+      "Bash(python -c \"\nimport sys\nfor lib in ['langgraph', 'langchain_core', 'langchain_anthropic', 'headless_oracle', 'dotenv']:\n    try:\n        __import__\\(lib\\)\n        print\\(f'{lib}: OK'\\)\n    except ImportError as e:\n        print\\(f'{lib}: MISSING - {e}'\\)\n\" 2>&1)"
+    ]
+  }
+}

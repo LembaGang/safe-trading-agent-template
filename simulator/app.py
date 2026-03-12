@@ -24,7 +24,7 @@ try:
 except ImportError:
     pass
 
-from simulator.model import (
+from model import (
     TradeScenario,
     simulate,
     build_phantom_hour_timeline,
@@ -177,8 +177,12 @@ fig.add_trace(go.Scatter(
 ))
 
 # Highlight the phantom hour region
+# add_vrect/add_vline require numeric x on categorical axes — use index positions.
+idx_20 = times.index("20:00")
+idx_21 = times.index("21:00")
+
 fig.add_vrect(
-    x0="20:00", x1="21:00",
+    x0=idx_20, x1=idx_21,
     fillcolor="rgba(239, 68, 68, 0.12)",
     layer="below",
     line_width=0,
@@ -189,7 +193,7 @@ fig.add_vrect(
 
 # Real close marker
 fig.add_vline(
-    x="20:00",
+    x=idx_20,
     line_color="#22c55e",
     line_dash="dot",
     line_width=2,
