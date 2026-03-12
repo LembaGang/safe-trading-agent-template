@@ -1,0 +1,8 @@
+# Capital Loss Simulator — Streamlit deployment dependencies
+# Run: pip install -r requirements-sim.txt
+# Launch: streamlit run simulator/app.py
+
+streamlit>=1.35
+plotly>=5.20
+headless-oracle>=0.1.0
+python-dotenv>=1.0
