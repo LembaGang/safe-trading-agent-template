@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "safe-trading-agent-template"
-version = "0.1.0"
+version = "0.2.0"
 description = "LangGraph starter for autonomous trading agents gated by Headless Oracle market verification"
 readme = "README.md"
 license = { text = "MIT" }

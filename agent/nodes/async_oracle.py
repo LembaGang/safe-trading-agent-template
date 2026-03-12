@@ -4,15 +4,17 @@ async_oracle.py — Enterprise async batch oracle verification.
 The bottleneck for multi-position agents running serial oracle checks:
   50 positions × ~200ms HTTP round-trip = ~10 seconds of pure I/O wait.
 
-This module eliminates that with concurrent async execution:
-  50 positions × asyncio.gather = ~200ms total (bounded by the slowest receipt).
+This module eliminates that with two strategies, selected automatically:
 
-Two fetch strategies — same fail-closed contract for both:
-  No API key  → N concurrent calls to /v5/demo via asyncio.to_thread
-  API key set → N concurrent calls to /v5/status via asyncio.to_thread
-               (Power users: swap to a single client.get_batch() call for 1 HTTP round-trip)
+  Strategy A — /v5/batch (API key set, default):
+    Single HTTP connection, single round-trip, N receipts returned in order.
+    100 positions → 1 request, ~200ms. Thread-pool usage: 1 slot.
 
-Fail-closed guarantee:
+  Strategy B — N concurrent /v5/demo calls (no API key):
+    N asyncio.to_thread calls, each in its own thread. Total latency still
+    bounded by the slowest receipt, not the sum. Thread-pool usage: N slots.
+
+Both paths converge on the same verify() logic and fail-closed contract:
   Any exception, invalid signature, expired TTL, or non-OPEN status produces
   valid=False for the affected MIC. ALL MICs must be valid + OPEN for
   BatchResult.can_execute() to return True. UNKNOWN is never permissive.
@@ -21,7 +23,11 @@ Usage:
     import asyncio
     from agent.nodes.async_oracle import batch_oracle_check, portfolio_can_execute
 
+    # Authenticated (API key in env) — single /v5/batch call:
     result = asyncio.run(batch_oracle_check(["XNYS", "XNAS", "XLON"]))
+
+    # Explicit concurrent path (e.g. demo mode, no API key):
+    result = asyncio.run(batch_oracle_check(["XNYS", "XNAS"], use_batch=False))
 
     if portfolio_can_execute(result):
         broker.submit_portfolio_orders(...)
@@ -29,8 +35,10 @@ Usage:
         print(f"Halted MICs: {result.halted_mics()}")
 
 Environment variables:
-  ORACLE_API_KEY    — Enables /v5/status (live, authenticated). Falls back to /v5/demo if unset.
-  ORACLE_PUBLIC_KEY — Hex Ed25519 public key. Pins the key to avoid one /v5/keys fetch per call.
+  ORACLE_API_KEY    — Enables /v5/status and /v5/batch (authenticated).
+                      Absent → /v5/demo concurrent path.
+  ORACLE_PUBLIC_KEY — Hex Ed25519 public key. Pins the key to skip the
+                      /v5/keys round-trip on every verify() call.
 """
 
 from __future__ import annotations
@@ -61,7 +69,7 @@ class MICResult:
 
     @property
     def executable(self) -> bool:
-        """True only when this MIC is safe to trade on."""
+        """True only when this MIC is verified and OPEN."""
         return self.valid and self.market_status == "OPEN"
 
 
@@ -90,18 +98,16 @@ class BatchResult:
         return [mic for mic, r in self.results.items() if r.executable]
 
 
-# ── Core sync unit (I/O + verify for one MIC) ─────────────────────────────────
+# ── Sync unit: one MIC, one HTTP call ─────────────────────────────────────────
 
 def _fetch_and_verify_one(mic: str) -> MICResult:
     """
     Fetch and verify a signed oracle receipt for a single MIC.
 
-    This is the synchronous unit that async_oracle wraps with asyncio.to_thread.
-    Keeping it sync preserves compatibility with the OracleClient (sync httpx).
-
-    Never raises. All failure modes return valid=False with a descriptive halt_reason.
+    Used by Strategy B (concurrent /v5/demo, or fallback per-MIC /v5/status).
+    Each call opens its own OracleClient — no shared HTTP state.
+    Never raises. All failure modes return valid=False.
     """
-    # Step 1: Fetch receipt
     try:
         with OracleClient(api_key=_ORACLE_API_KEY) as client:
             receipt: dict[str, Any] = (
@@ -117,7 +123,6 @@ def _fetch_and_verify_one(mic: str) -> MICResult:
             halt_reason=f"Oracle unreachable: {exc}",
         )
 
-    # Step 2: Verify Ed25519 signature + TTL
     result: VerifyResult = verify(receipt, public_key=_ORACLE_PUBLIC_KEY or None)
     if not result.valid:
         return MICResult(
@@ -128,7 +133,6 @@ def _fetch_and_verify_one(mic: str) -> MICResult:
             halt_reason=f"Receipt invalid ({result.reason}) — fail-closed",
         )
 
-    # Step 3: Extract status
     status: str = receipt.get("status", "UNKNOWN")
     return MICResult(
         mic=mic,
@@ -139,23 +143,96 @@ def _fetch_and_verify_one(mic: str) -> MICResult:
     )
 
 
+# ── Sync unit: all MICs, one HTTP call (/v5/batch) ────────────────────────────
+
+def _fetch_batch_one_shot(mics: list[str]) -> list[MICResult]:
+    """
+    Fetch signed receipts for N MICs in a single /v5/batch HTTP call.
+
+    Requires ORACLE_API_KEY. Reduces N HTTP round-trips to 1, and N thread-pool
+    slots to 1. This is the Strategy A path for authenticated production agents.
+
+    Response schema: {"receipts": [{...}, ...]} in the same order as the input.
+
+    Never raises. On total batch failure all MICs fail closed. On a missing or
+    malformed individual receipt that MIC fails closed, others are unaffected.
+    """
+    try:
+        with OracleClient(api_key=_ORACLE_API_KEY) as client:
+            response: dict[str, Any] = client.get_batch(mics)
+    except Exception as exc:
+        # Catastrophic: can't reach /v5/batch at all — fail all MICs closed.
+        return [
+            MICResult(
+                mic=mic,
+                valid=False,
+                market_status="UNKNOWN",
+                halt_reason=f"Batch fetch failed: {exc}",
+            )
+            for mic in mics
+        ]
+
+    # Parse batch response: {"receipts": [{receipt}, ...]} ordered by input.
+    receipts: list[Any] = response.get("receipts", [])
+
+    results: list[MICResult] = []
+    for i, mic in enumerate(mics):
+        receipt = receipts[i] if i < len(receipts) else None
+
+        if not isinstance(receipt, dict):
+            results.append(MICResult(
+                mic=mic,
+                valid=False,
+                market_status="UNKNOWN",
+                halt_reason="Missing or malformed receipt in batch response — fail-closed",
+            ))
+            continue
+
+        verify_result: VerifyResult = verify(receipt, public_key=_ORACLE_PUBLIC_KEY or None)
+        if not verify_result.valid:
+            results.append(MICResult(
+                mic=mic,
+                valid=False,
+                market_status="UNKNOWN",
+                receipt=receipt,
+                halt_reason=f"Receipt invalid ({verify_result.reason}) — fail-closed",
+            ))
+            continue
+
+        status: str = receipt.get("status", "UNKNOWN")
+        results.append(MICResult(
+            mic=mic,
+            valid=True,
+            market_status=status,
+            receipt=receipt,
+            halt_reason=None if status == "OPEN" else f"Market is {status}",
+        ))
+
+    return results
+
+
 # ── Async orchestrator ────────────────────────────────────────────────────────
 
-async def batch_oracle_check(mics: list[str]) -> BatchResult:
+async def batch_oracle_check(
+    mics: list[str],
+    *,
+    use_batch: bool = True,
+) -> BatchResult:
     """
-    Fetch and verify oracle receipts for N MICs concurrently.
+    Fetch and verify oracle receipts for N MICs.
 
-    Each MIC check runs in a thread (via asyncio.to_thread) so the sync
-    OracleClient HTTP calls don't block the event loop. All N checks run
-    concurrently — total latency is bounded by the single slowest receipt.
+    Strategy selection (automatic unless overridden):
+      API key set + use_batch=True  → single /v5/batch call (1 thread, 1 request)
+      No API key  OR use_batch=False → N concurrent /v5/demo calls via asyncio.gather
 
     Args:
-        mics: MIC codes to check (e.g. ["XNYS", "XNAS", "XLON"]).
-              Duplicate MICs are deduplicated before fetching.
+        mics:      MIC codes to check. Duplicates are deduplicated before fetching.
+        use_batch: Set False to force the per-MIC concurrent path even when
+                   ORACLE_API_KEY is set (e.g. for testing or explicit override).
 
     Returns:
         BatchResult. Call .can_execute() before submitting portfolio orders.
-        Call .halted_mics() to log which exchanges blocked execution.
+        Call .halted_mics() to identify which exchanges blocked execution.
 
     Never raises. All failures produce valid=False for the affected MIC.
     """
@@ -164,9 +241,13 @@ async def batch_oracle_check(mics: list[str]) -> BatchResult:
 
     unique_mics = list(dict.fromkeys(mics))  # deduplicate, preserve order
 
-    # Each to_thread call gets its own OracleClient — no shared state.
-    tasks = [asyncio.to_thread(_fetch_and_verify_one, mic) for mic in unique_mics]
-    mic_results: list[MICResult] = await asyncio.gather(*tasks)
+    if _ORACLE_API_KEY and use_batch:
+        # Strategy A: single /v5/batch HTTP call — 1 thread, 1 round-trip.
+        mic_results = await asyncio.to_thread(_fetch_batch_one_shot, unique_mics)
+    else:
+        # Strategy B: N concurrent calls, each in its own thread.
+        tasks = [asyncio.to_thread(_fetch_and_verify_one, mic) for mic in unique_mics]
+        mic_results = await asyncio.gather(*tasks)
 
     return BatchResult(results={r.mic: r for r in mic_results})
 
@@ -180,7 +261,7 @@ def portfolio_can_execute(batch_result: BatchResult) -> bool:
     Returns True only when every MIC in the batch is verified OPEN.
     One closed or unreachable exchange halts the entire portfolio.
 
-    For strategies that should gate per-position independently (not as a block),
+    For per-position independent gating (not a portfolio-wide block),
     iterate batch_result.results and check each MICResult.executable directly.
     """
     return batch_result.can_execute()

@@ -3,7 +3,7 @@ run_agent.py — Full example: LangGraph agent gated by Headless Oracle.
 
 Requirements:
   1. Copy .env.example to .env and populate it
-  2. pip install -e ".[dev]"
+  2. pip install -r requirements.txt
   3. python examples/run_agent.py
 
 The agent will:

@@ -103,16 +103,62 @@ See `examples/demo_without_llm.py` for the full version with error handling.
 
 ---
 
+## Enterprise: async batch verification
+
+When an agent manages 50+ concurrent positions, serial oracle checks are a
+bottleneck. `agent/nodes/async_oracle.py` eliminates this:
+
+| Approach | Requests | Threads | Latency |
+|----------|----------|---------|---------|
+| Serial (naïve) | N | 1 | N × 200ms |
+| Concurrent (no API key) | N | N | ~200ms |
+| **Batch (API key)** | **1** | **1** | **~200ms** |
+
+```python
+import asyncio
+from agent.nodes.async_oracle import batch_oracle_check, portfolio_can_execute
+
+# Authenticated: single /v5/batch call — 1 HTTP request for all MICs
+result = asyncio.run(batch_oracle_check(["XNYS", "XNAS", "XLON", "XJPX"]))
+
+if portfolio_can_execute(result):
+    broker.submit_portfolio_orders(...)
+else:
+    # Inspect which exchanges blocked execution
+    for mic in result.halted_mics():
+        print(f"{mic}: {result.results[mic].halt_reason}")
+```
+
+The fail-closed contract is identical regardless of strategy: any fetch failure,
+invalid signature, expired TTL, or non-OPEN status produces `valid=False` for
+that MIC. `can_execute()` is a strict AND gate.
+
+---
+
+## Capital Loss Simulator — The Phantom Hour
+
+`simulator/app.py` is a Streamlit application that makes the DST timezone math
+bug visceral: it simulates a bot hardcoding UTC-5 year-round, fires phantom
+orders into dark pools after real market close, and calculates the exact
+slippage + MEV extraction cost vs. the Oracle Bot's $0 loss.
+
+```bash
+pip install -r requirements-sim.txt
+streamlit run simulator/app.py
+```
+
+---
+
 ## Running the tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v           # 87 tests, all offline
 
-# Skip live-API integration tests (offline only):
+# Skip live-API integration tests:
 pytest tests/ -v -m "not integration"
 ```
 
-The test suite uses a generated Ed25519 keypair — no live API calls needed for the unit tests.
+The test suite uses a generated Ed25519 keypair — no live API calls needed.
 
 ---
 
@@ -121,19 +167,29 @@ The test suite uses a generated Ed25519 keypair — no live API calls needed for
 ```
 safe-trading-agent-template/
 ├── agent/
-│   ├── graph.py          # LangGraph StateGraph — the 4-gate topology
-│   ├── state.py          # AgentState TypedDict
+│   ├── graph.py              # LangGraph StateGraph — the 4-gate topology
+│   ├── state.py              # AgentState TypedDict
 │   └── nodes/
-│       ├── reasoning.py  # LLM pre-trade reasoning (Claude Haiku)
-│       ├── oracle.py     # Fetch + Ed25519 verify oracle receipt
-│       └── execution.py  # Execute (stub) + failsafe (halt) nodes
+│       ├── oracle.py         # Single-MIC: fetch + Ed25519 verify
+│       ├── async_oracle.py   # Multi-MIC: async batch verification
+│       ├── reasoning.py      # LLM pre-trade reasoning (Claude Haiku)
+│       └── execution.py      # Execute (stub) + failsafe (halt) nodes
+├── simulator/
+│   ├── model.py              # Pure DST loss simulation model (no I/O)
+│   └── app.py                # Streamlit Capital Loss Simulator
 ├── tests/
-│   ├── conftest.py              # Test keypair + receipt fixtures
-│   ├── test_oracle_verify.py    # Verification unit tests
-│   └── test_graph_routing.py    # Full graph routing tests
-└── examples/
-    ├── run_agent.py         # Full LangGraph agent
-    └── demo_without_llm.py  # Minimal gate demo, no LLM
+│   ├── conftest.py                  # Test keypair + receipt fixtures
+│   ├── test_oracle_verify.py        # Verification unit tests
+│   ├── test_graph_routing.py        # Full graph routing tests
+│   ├── test_async_oracle.py         # Async batch oracle tests
+│   └── test_simulator_model.py      # Simulator model tests
+├── docs/
+│   └── algotrading-community-posts.md  # Draft Reddit + X posts
+├── examples/
+│   ├── run_agent.py          # Full LangGraph agent
+│   └── demo_without_llm.py   # Minimal gate demo, no LLM
+├── requirements.txt          # Runtime + test deps
+└── requirements-sim.txt      # Simulator deps (streamlit, plotly)
 ```
 
 ---

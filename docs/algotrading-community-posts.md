@@ -3,6 +3,8 @@
 Draft posts for r/algotrading, r/Python, and X/Twitter. All code blocks are verified against
 `headless-oracle==0.1.0` (PyPI). Run `pip install headless-oracle` to confirm locally.
 
+Template version: v0.2.0 — includes async batch verification and Capital Loss Simulator.
+
 ---
 
 ## Reddit — r/algotrading
@@ -229,7 +231,28 @@ reasoning → oracle_check → execute OR halt
 
 ---
 
-**Tweet 7 (close):**
+**Tweet 7 (enterprise scale):**
+
+Running 50 positions? Don't make 50 serial oracle calls.
+
+```python
+import asyncio
+from agent.nodes.async_oracle import batch_oracle_check
+
+# Single /v5/batch call — 1 request, all MICs, ~200ms
+result = asyncio.run(batch_oracle_check(["XNYS","XNAS","XLON","XJPX"]))
+
+if result.can_execute():
+    broker.submit_portfolio_orders()
+else:
+    print(result.halted_mics())  # which exchanges blocked execution
+```
+
+One HTTP connection. Fail-closed per MIC.
+
+---
+
+**Tweet 8 (close):**
 
 Supported: XNYS XNAS XLON XJPX XPAR XHKG XSES
 

@@ -321,3 +321,168 @@ class TestBatchOracleCheck:
             _run(batch_oracle_check(mics))
 
         assert set(mics_fetched) == set(mics)
+
+    def test_use_batch_false_forces_concurrent_path(self):
+        """use_batch=False skips /v5/batch even when API key is set."""
+        calls = []
+
+        def fake_fetch(mic):
+            calls.append(mic)
+            return _open(mic)
+
+        with (
+            patch("agent.nodes.async_oracle._ORACLE_API_KEY", "ok_live_test"),
+            patch("agent.nodes.async_oracle._fetch_and_verify_one", side_effect=fake_fetch),
+        ):
+            result = _run(batch_oracle_check(["XNYS", "XNAS"], use_batch=False))
+
+        assert set(calls) == {"XNYS", "XNAS"}
+        assert result.can_execute() is True
+
+
+# ── 6. _fetch_batch_one_shot() — batch path ───────────────────────────────────
+
+class TestFetchBatchOneShot:
+    from agent.nodes.async_oracle import _fetch_batch_one_shot  # imported at class body
+
+    def test_all_open_receipts_return_executable(self):
+        """Well-formed batch response with all-OPEN receipts → all executable."""
+        receipts = [
+            _make_receipt(mic="XNYS", status="OPEN"),
+            _make_receipt(mic="XNAS", status="OPEN"),
+        ]
+        with (
+            patch("agent.nodes.async_oracle.OracleClient") as MockClient,
+            patch("agent.nodes.async_oracle.verify") as mock_verify,
+        ):
+            ctx = MockClient.return_value.__enter__.return_value
+            ctx.get_batch.return_value = {"receipts": receipts}
+            mock_verify.return_value = VerifyResult(valid=True)
+
+            from agent.nodes.async_oracle import _fetch_batch_one_shot
+            results = _fetch_batch_one_shot(["XNYS", "XNAS"])
+
+        assert len(results) == 2
+        assert all(r.executable for r in results)
+        ctx.get_batch.assert_called_once_with(["XNYS", "XNAS"])
+
+    def test_closed_receipt_in_batch_not_executable(self):
+        receipts = [
+            _make_receipt(mic="XNYS", status="OPEN"),
+            _make_receipt(mic="XLON", status="CLOSED"),
+        ]
+        with (
+            patch("agent.nodes.async_oracle.OracleClient") as MockClient,
+            patch("agent.nodes.async_oracle.verify") as mock_verify,
+        ):
+            ctx = MockClient.return_value.__enter__.return_value
+            ctx.get_batch.return_value = {"receipts": receipts}
+            mock_verify.return_value = VerifyResult(valid=True)
+
+            from agent.nodes.async_oracle import _fetch_batch_one_shot
+            results = _fetch_batch_one_shot(["XNYS", "XLON"])
+
+        xnys = next(r for r in results if r.mic == "XNYS")
+        xlon = next(r for r in results if r.mic == "XLON")
+        assert xnys.executable is True
+        assert xlon.executable is False
+        assert xlon.market_status == "CLOSED"
+
+    def test_invalid_signature_in_batch_fails_closed(self):
+        receipts = [_make_receipt(mic="XNYS", status="OPEN")]
+
+        def verify_side_effect(receipt, **kwargs):
+            return VerifyResult(valid=False, reason="INVALID_SIGNATURE")
+
+        with (
+            patch("agent.nodes.async_oracle.OracleClient") as MockClient,
+            patch("agent.nodes.async_oracle.verify", side_effect=verify_side_effect),
+        ):
+            ctx = MockClient.return_value.__enter__.return_value
+            ctx.get_batch.return_value = {"receipts": receipts}
+
+            from agent.nodes.async_oracle import _fetch_batch_one_shot
+            results = _fetch_batch_one_shot(["XNYS"])
+
+        assert results[0].valid is False
+        assert "INVALID_SIGNATURE" in results[0].halt_reason
+
+    def test_batch_network_failure_fails_all_mics_closed(self):
+        with (
+            patch("agent.nodes.async_oracle.OracleClient") as MockClient,
+        ):
+            MockClient.return_value.__enter__.side_effect = ConnectionError("unreachable")
+
+            from agent.nodes.async_oracle import _fetch_batch_one_shot
+            results = _fetch_batch_one_shot(["XNYS", "XNAS", "XLON"])
+
+        assert len(results) == 3
+        assert all(r.valid is False for r in results)
+        assert all(r.market_status == "UNKNOWN" for r in results)
+        assert all("Batch fetch failed" in r.halt_reason for r in results)
+
+    def test_missing_receipt_in_batch_fails_that_mic_closed(self):
+        """If the batch response has fewer receipts than MICs, extras fail closed."""
+        receipts = [_make_receipt(mic="XNYS", status="OPEN")]  # only 1 of 2
+        with (
+            patch("agent.nodes.async_oracle.OracleClient") as MockClient,
+            patch("agent.nodes.async_oracle.verify") as mock_verify,
+        ):
+            ctx = MockClient.return_value.__enter__.return_value
+            ctx.get_batch.return_value = {"receipts": receipts}
+            mock_verify.return_value = VerifyResult(valid=True)
+
+            from agent.nodes.async_oracle import _fetch_batch_one_shot
+            results = _fetch_batch_one_shot(["XNYS", "XNAS"])
+
+        assert results[0].executable is True   # XNYS — receipt present
+        assert results[1].valid is False        # XNAS — missing receipt
+        assert "Missing" in results[1].halt_reason
+
+    def test_null_receipt_entry_fails_closed(self):
+        """A None entry in the receipts list fails that MIC closed."""
+        with (
+            patch("agent.nodes.async_oracle.OracleClient") as MockClient,
+            patch("agent.nodes.async_oracle.verify") as mock_verify,
+        ):
+            ctx = MockClient.return_value.__enter__.return_value
+            ctx.get_batch.return_value = {"receipts": [None]}
+            mock_verify.return_value = VerifyResult(valid=True)
+
+            from agent.nodes.async_oracle import _fetch_batch_one_shot
+            results = _fetch_batch_one_shot(["XNYS"])
+
+        assert results[0].valid is False
+        assert "malformed" in results[0].halt_reason
+
+
+# ── 7. batch_oracle_check() routes to /v5/batch when key is set ───────────────
+
+class TestBatchPathRouting:
+    def test_api_key_set_uses_batch_one_shot(self):
+        """With API key + use_batch=True (default), _fetch_batch_one_shot is called."""
+        batch_results = [_open("XNYS"), _open("XNAS")]
+        with (
+            patch("agent.nodes.async_oracle._ORACLE_API_KEY", "ok_live_test"),
+            patch("agent.nodes.async_oracle._fetch_batch_one_shot", return_value=batch_results) as mock_batch,
+        ):
+            result = _run(batch_oracle_check(["XNYS", "XNAS"]))
+
+        mock_batch.assert_called_once_with(["XNYS", "XNAS"])
+        assert result.can_execute() is True
+
+    def test_no_api_key_uses_concurrent_path(self):
+        """Without API key, per-MIC concurrent path is used regardless of use_batch."""
+        calls = []
+
+        def fake_fetch(mic):
+            calls.append(mic)
+            return _open(mic)
+
+        with (
+            patch("agent.nodes.async_oracle._ORACLE_API_KEY", None),
+            patch("agent.nodes.async_oracle._fetch_and_verify_one", side_effect=fake_fetch),
+        ):
+            _run(batch_oracle_check(["XNYS", "XNAS"]))
+
+        assert set(calls) == {"XNYS", "XNAS"}
